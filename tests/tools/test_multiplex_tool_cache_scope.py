@@ -46,24 +46,34 @@ def two_homes(tmp_path, monkeypatch):
 
 
 def test_camofox_vnc_memo_is_keyed_by_the_profiles_server_url(two_homes, monkeypatch):
-    """The one-shot VNC probe must not answer B (own CAMOFOX_URL) with A's server address."""
+    """The one-shot VNC discovery (toggle-display, run when a profile's first tab is
+    created) must not answer B (own CAMOFOX_URL) with A's server address."""
     import tools.browser_camofox as cam
+
+    monkeypatch.setenv("CAMOFOX_ENABLE_VNC", "true")
 
     class _Resp:
         status_code = 200
 
         def __init__(self, url):
-            self._port = 6001 if "camofox-a" in url else 6002
+            self._url = url
+
+        def raise_for_status(self):
+            pass
 
         def json(self):
-            return {"ok": True, "vncPort": self._port}
+            if self._url.endswith("/tabs"):
+                return {"tabId": "t1"}
+            vnc_host = "camofox-a" if "camofox-a" in self._url else "camofox-b"
+            return {"ok": True, "vncUrl": f"http://{vnc_host}:{6001 if vnc_host == 'camofox-a' else 6002}"}
 
-    monkeypatch.setattr(cam.requests, "get", lambda url, *a, **k: _Resp(url))
+    monkeypatch.setattr(cam.requests, "post", lambda url, *a, **k: _Resp(url))
     a, b = two_homes
     with _scoped(a):
-        assert cam.check_camofox_available() is True
+        cam._ensure_tab("task-a")
         assert cam.get_vnc_url() == "http://camofox-a:6001"
     with _scoped(b):
+        cam._ensure_tab("task-b")
         assert cam.get_vnc_url() == "http://camofox-b:6002"
     with _scoped(a):
         assert cam.get_vnc_url() == "http://camofox-a:6001"

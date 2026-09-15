@@ -110,19 +110,8 @@ def is_camofox_mode() -> bool:
     return bool(get_camofox_url())
 
 
-def _vnc_url_from_health(url: str, resp: Any) -> Optional[str]:
-    try:
-        vnc_port = resp.json().get("vncPort")
-        if isinstance(vnc_port, int) and 1 <= vnc_port <= 65535:
-            return f"http://{urlsplit(url).hostname or 'localhost'}:{vnc_port}"
-    except (ValueError, KeyError):
-        pass
-    return None
-
-
 def check_camofox_available() -> bool:
-    """Verify the Camofox server is reachable (and cache its VNC URL once)."""
-    global _vnc_url, _vnc_url_checked
+    """Verify the Camofox server is reachable."""
     url = get_camofox_url()
     if not url:
         return False
@@ -130,26 +119,55 @@ def check_camofox_available() -> bool:
         resp = requests.get(f"{url}/health", timeout=5)
     except Exception:
         return False
-    if resp.status_code == 200:
-        if get_hermes_home_override() is not None:
-            if url not in _vnc_url_by_camofox_url:
-                _vnc_url_by_camofox_url[url] = _vnc_url_from_health(url, resp)
-        elif not _vnc_url_checked:
-            _vnc_url = _vnc_url_from_health(url, resp) or _vnc_url
-            _vnc_url_checked = True
     return resp.status_code == 200
 
 
-def get_vnc_url() -> Optional[str]:
-    """Return the VNC URL if the Camofox server exposes one, or None."""
+def _vnc_cache_checked() -> bool:
+    """Whether the one-shot VNC discovery has already run for this profile's server."""
     if get_hermes_home_override() is not None:
-        url = get_camofox_url()
-        if url not in _vnc_url_by_camofox_url:
-            check_camofox_available()
-        return _vnc_url_by_camofox_url.get(url)
-    if not _vnc_url_checked:
-        check_camofox_available()
+        return get_camofox_url() in _vnc_url_by_camofox_url
+    return _vnc_url_checked
+
+
+def _vnc_cache_store(value: Optional[str]) -> None:
+    global _vnc_url, _vnc_url_checked
+    if get_hermes_home_override() is not None:
+        _vnc_url_by_camofox_url[get_camofox_url()] = value
+    else:
+        _vnc_url, _vnc_url_checked = value, True
+
+
+def get_vnc_url() -> Optional[str]:
+    """Return the last-discovered Camofox VNC URL for this profile's server, or None.
+
+    Populated lazily by :func:`_ensure_tab` the first time a tab is created for this
+    profile's Camofox server (one-shot, like the old health-derived cache it replaced).
+    """
+    if get_hermes_home_override() is not None:
+        return _vnc_url_by_camofox_url.get(get_camofox_url())
     return _vnc_url
+
+
+def _enable_vnc(camofox_cfg: Dict[str, Any]) -> bool:
+    """``browser.camofox.vnc`` / ``CAMOFOX_ENABLE_VNC``: opt-in, since discovering the VNC
+    URL restarts the browser context (Linux-only Xvfb/x11vnc bridge) and Camofox exposes a
+    single shared display per server — fine for one visible session, not for concurrent ones."""
+    return _flag("CAMOFOX_ENABLE_VNC", camofox_cfg, "vnc")
+
+
+def _start_vnc(session: Dict[str, Any]) -> Optional[str]:
+    """``POST /sessions/:userId/toggle-display`` with ``{"headless": "virtual"}``.
+
+    This is the real Camofox VNC contract (no static ``vncPort`` on ``/health`` — the noVNC
+    URL, with its one-time auth token, only comes back from this call). It restarts the
+    browser context, invalidating any tab the caller already holds.
+    """
+    try:
+        data = _post(f"/sessions/{session['user_id']}/toggle-display", {"headless": "virtual"}, timeout=60)
+    except Exception as exc:
+        logger.warning("Camofox VNC start failed for %s: %s", session["user_id"], exc)
+        return None
+    return data.get("vncUrl") or None
 
 
 def _get_camofox_config() -> Dict[str, Any]:
@@ -282,11 +300,23 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
 
 
 def _ensure_tab(task_id: Optional[str], url: str = "about:blank") -> Dict[str, Any]:
-    """Ensure a tab exists for the session, creating one if needed."""
+    """Ensure a tab exists for the session, creating one if needed.
+
+    On the first tab ever created for this profile's Camofox server, also runs the one-shot
+    VNC discovery (see :func:`_start_vnc`) when enabled: that restarts the browser context,
+    so the just-created tab is invalidated and recreated below.
+    """
     session = _get_session(task_id)
     if not session["tab_id"]:
         data = _post("/tabs", {"userId": session["user_id"], "listItemId": session["session_key"], "url": url})
         session["tab_id"] = data.get("tabId")
+        if not _vnc_cache_checked():
+            camofox_cfg = _get_camofox_config()
+            vnc_url = _start_vnc(session) if _enable_vnc(camofox_cfg) else None
+            _vnc_cache_store(vnc_url)
+            if vnc_url:
+                data = _post("/tabs", {"userId": session["user_id"], "listItemId": session["session_key"], "url": url})
+                session["tab_id"] = data.get("tabId")
     return session
 
 

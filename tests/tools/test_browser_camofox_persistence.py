@@ -12,12 +12,12 @@ import pytest
 
 from tools.browser_camofox import (
     _drop_session,
+    _ensure_tab,
     _get_session,
     _managed_persistence_enabled,
     camofox_close,
     camofox_navigate,
     camofox_soft_cleanup,
-    check_camofox_available,
     get_vnc_url,
 )
 from tools.browser_camofox_state import get_camofox_identity
@@ -260,14 +260,36 @@ class TestConfiguredCamofoxIdentity:
 
 
 class TestVncUrlDiscovery:
-    """VNC URL is derived from the Camofox health endpoint."""
+    """VNC URL is discovered via ``toggle-display`` the first time a tab is created,
+    gated by ``CAMOFOX_ENABLE_VNC`` (Camofox has no static VNC port on ``/health``)."""
 
-    def test_vnc_url_from_health_port(self, monkeypatch):
+    def test_vnc_url_from_toggle_display(self, monkeypatch):
         monkeypatch.setenv("CAMOFOX_URL", "http://myhost:9377")
-        health_resp = _mock_response(json_data={"ok": True, "vncPort": 6080})
-        with patch("tools.browser_camofox.requests.get", return_value=health_resp):
-            assert check_camofox_available() is True
-        assert get_vnc_url() == "http://myhost:6080"
+        monkeypatch.setenv("CAMOFOX_ENABLE_VNC", "true")
+
+        def fake_post(path, body, timeout=None):
+            if path == "/tabs":
+                return {"tabId": "t1"}
+            assert path.endswith("/toggle-display")
+            assert body == {"headless": "virtual"}
+            return {"ok": True, "vncUrl": "http://myhost:6080/vnc.html?token=abc"}
+
+        with patch("tools.browser_camofox._post", side_effect=fake_post):
+            session = _ensure_tab("vnc-toggle-test")
+
+        assert session["tab_id"] == "t1"
+        assert get_vnc_url() == "http://myhost:6080/vnc.html?token=abc"
+
+
+    def test_vnc_not_discovered_when_disabled(self, monkeypatch):
+        monkeypatch.setenv("CAMOFOX_URL", "http://myhost:9377")
+        monkeypatch.delenv("CAMOFOX_ENABLE_VNC", raising=False)
+
+        with patch("tools.browser_camofox._post", return_value={"tabId": "t1"}) as mock_post:
+            _ensure_tab("vnc-disabled-test")
+
+        assert mock_post.call_count == 1  # only the /tabs POST — no toggle-display probe
+        assert get_vnc_url() is None
 
 
     def test_navigate_includes_vnc_hint(self, tmp_path, monkeypatch):
